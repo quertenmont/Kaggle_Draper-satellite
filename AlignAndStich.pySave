@@ -1,0 +1,215 @@
+# import the necessary packages
+import numpy as np
+import cv2
+import glob
+import math, sys, os
+
+print("CV2 version " + cv2.__version__)
+#help(cv2)
+
+def dump(obj):
+   for attr in dir(obj):
+       if hasattr( obj, attr ):
+           print( "obj.%s = %s" % (attr, getattr(obj, attr)))
+
+def mergePicturePair(imgA, imgB, average=True):
+   imgAgrey = imgA
+   if(len(imgA.shape)>2): imgAgrey = cv2.cvtColor(imgA.copy(), cv2.COLOR_BGR2GRAY)
+   imgBgrey = imgB
+   if(len(imgB.shape)>2): imgBgrey = cv2.cvtColor(imgB.copy(), cv2.COLOR_BGR2GRAY)
+
+   _, imgAmask = cv2.threshold(imgAgrey, 1, 255, cv2.THRESH_BINARY)
+   _, imgBmask = cv2.threshold(imgBgrey, 1, 255, cv2.THRESH_BINARY)
+   imgOmask = cv2.bitwise_and( imgAmask, imgBmask )
+   imgNmask = cv2.bitwise_not( imgOmask )
+
+   out = cv2.bitwise_xor(imgA, imgA);
+   out = cv2.add( out, imgA, mask=imgNmask)
+   out = cv2.add( out, imgB, mask=imgNmask)
+
+   overlap = cv2.bitwise_xor(imgA, imgA);
+   if(average):
+      overlap = cv2.add( overlap, imgA/2, mask=imgOmask)
+      overlap = cv2.add( overlap, imgB/2, mask=imgOmask)
+   else:
+      overlap = cv2.add( overlap, imgA, mask=imgOmask)  #do not average
+   return overlap+out
+
+def mergePictures(imgList, average=True):
+   toReturn = imgList[0]
+   for i in range(1, len(imgList)):
+      toReturn = mergePicturePair(toReturn, imgList[i], average)
+   return toReturn
+
+def getTrimRec(img):
+   imgGrey = img.copy()
+   if(len(img.shape)>2): imgGrey = cv2.cvtColor(img.copy(), cv2.COLOR_BGR2GRAY)
+   contours = cv2.findContours(imgGrey,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE)
+   return cv2.boundingRect(contours[0])
+
+def trimImage(img, trimRec):
+   x,y,w,h = trimRec 
+   return img[y:y+h+1,x:x+w+1]
+
+def preparePictures(imgList, orb, bf):
+   #initialize object
+#   orb = cv2.ORB_create(WTA_K=2, patchSize=31, edgeThreshold=31, nlevels=8, scaleFactor=1.1, nfeatures=2000)
+#   bf = cv2.BFMatcher(cv2.NORM_HAMMING2, crossCheck=True)
+
+#   orb = cv2.ORB_create()
+#   bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+   #prepare pictures and identify KP 
+   imgDetails = []
+   for index, img in enumerate(imgList):
+#      imggrey = cv2.resize  (img, (img.shape[0]/2, img.shape[1]/2)) #reduce size
+      imggrey = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)          #turn to grey scale
+      imgDetails += [dict(imggrey=imggrey, kp=[], des=[], components=[[index,np.eye(3,3,dtype=np.float32)]])]
+
+   while(True):
+           #compute features
+           for i in range(0, len(imgDetails)):
+              imgDetails[i]['kp'], imgDetails[i]['des'] = orb.detectAndCompute(imgDetails[i]['imggrey'],None)
+
+	   #identify which pair to consider first
+	   Matches = []
+	   for i in range(0,len(imgDetails)):
+	      for j in range(0,len(imgDetails)):
+                 if(i==j):continue
+
+		 matches = bf.match(imgDetails[i]['des'], imgDetails[j]['des'])
+#                 matches = bf.knnMatch(imgDetails[i]['des'], imgDetails[j]['des'],k=2)
+#                 print matches
+
+ 	         matches = sorted(matches, key = lambda x:x.distance)
+                 matches = matches[:100]
+		 meanDist = 0;
+		 for e in matches:  meanDist+=e.distance
+		 Matches += [dict(i=i, j=j, matches=matches, mean=meanDist/len(matches))]
+	   Matches = sorted(Matches, key = lambda x:x['mean'])
+
+           bestMatch = None
+           M = None
+	   for match in Matches:
+   	      #compute Homography matrix for the best match
+ 	      src_pts = np.float32([ imgDetails[match['i']]['kp'][m.queryIdx].pt for m in match['matches'][:] ]).reshape(-1,1,2)
+	      dst_pts = np.float32([ imgDetails[match['j']]['kp'][m.trainIdx].pt for m in match['matches'][:] ]).reshape(-1,1,2)
+	      M, _ = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC,3.0)
+	      det = np.linalg.det(M[0:2,0:2])
+              print("%i - %i --> mean dist = %f   Det = %f" % (match['i'], match['j'], match['mean'], det))
+              bestMatch = match              
+              if(det>0.4 and det<2.5):break;
+
+           #work on the best matching pair
+           A = imgDetails[bestMatch['i']]
+           B = imgDetails[bestMatch['j']]
+           imgDetails.remove(B)
+
+         
+           pts = np.float32([ [0,0], [0,B['imggrey'].shape[0]],   [B['imggrey'].shape[1],0],  [B['imggrey'].shape[1],B['imggrey'].shape[0]] ]).reshape(-1,1,2)
+	   dst = cv2.perspectiveTransform(pts,M)
+
+           dst = np.concatenate( (dst, np.float32([ [0,0], [0,A['imggrey'].shape[0]],   [A['imggrey'].shape[1],0],  [A['imggrey'].shape[1],A['imggrey'].shape[0]] ]).reshape(-1,1,2)), axis=0 )
+           x,y,w,h = cv2.boundingRect(dst)
+           w= min(10000, w) #add to account for translation
+           h= min(10000, h) #add to account for translation
+
+           def matrixTransformationMultiplication(A,B):
+              Aext = np.eye(4,4)
+              Aext[:3,:3] = A
+              Bext = np.eye(4,4)
+              Bext[:3,:3] = B
+              return np.dot(A,B)[:3,:3]
+             
+	   Moffset = np.float32([[1,0,-1*x],[0,1,-1*y],[0,0,1]])
+	   M = M+np.float32([[0,0,-1*x],[0,0,-1*y],[0,0,0]])  #+Moffset;
+           
+           #translate reference images to make sure it stay in the frame
+           A['imggrey'] = cv2.warpPerspective(A['imggrey'], Moffset      , (w,h))
+           for c in range(0, len(A['components'])):
+              A['components'][c][1] = matrixTransformationMultiplication(Moffset, A['components'][c][1])
+
+           #transform matched images to align with the reference
+           B['imggrey'] = cv2.warpPerspective(B['imggrey'], M            , (w,h))
+           for c in range(0, len(B['components'])):
+              B['components'][c][1] = matrixTransformationMultiplication(M, B['components'][c][1])
+
+           #merge grey pictures
+           A['imggrey'] = mergePicturePair(A['imggrey'], B['imggrey'], average=False)
+           A['components'] += B['components']
+
+           #trim pictures           
+           trimRec = getTrimRec(A['imggrey'])
+           A['imggrey'] = trimImage(A['imggrey'], trimRec)
+           for c in range(0, len(A['components'])):
+              A['components'][c][1] = matrixTransformationMultiplication(np.float32([[1,0,-1*trimRec[0]],[0,1,-1*trimRec[1]],[0,0,1]]), A['components'][c][1])
+
+           #close the loop when only one element remains
+           if(len(imgDetails)==1):
+
+	      #order by picture number: 
+              imgDetails[0]['components'] = sorted(imgDetails[0]['components'], key = lambda x:x[0])
+
+              toReturn = []
+              for c in range(0, len(A['components'])):
+                 toReturn += [ cv2.warpPerspective(imgList[ A['components'][c][0] ], A['components'][c][1]      , trimRec[2:4]) ]
+
+              return toReturn 
+
+   print("Never suppose to get there\n")        
+  
+
+imagePathList = glob.glob("train_sm/*_1.jpeg")
+cv2.namedWindow('input', cv2.WINDOW_NORMAL)
+cv2.namedWindow('merged', cv2.WINDOW_NORMAL)
+for imagePath in imagePathList: 
+   images = []  
+   imagesKP = []   
+
+   orb = cv2.ORB_create(WTA_K=2, patchSize=31, edgeThreshold=31, nlevels=8, scaleFactor=1.05, nfeatures=4000) #31
+   bf = cv2.BFMatcher(cv2.NORM_HAMMING2, crossCheck=True)
+
+#   sift = cv2.xfeatures2d.SIFT_create()
+
+   print "processing " + imagePath
+   for i in range(1,6):
+       images += [cv2.imread(imagePath.replace("_1.jpeg", "_"+str(i)+".jpeg"))]
+       images[-1] = images[-1][:,:3099,:]
+       print images[-1].shape
+       images[-1] = cv2.resize  (images[-1], (images[-1].shape[1]/2, images[-1].shape[0]/2)) #reduce size
+
+#       kp, des = orb.detectAndCompute(images[-1],None)
+       kp, des = orb.detectAndCompute(images[-1],None)
+       imagesKP += [images[-1].copy()]
+       cv2.drawKeypoints(images[-1], kp, imagesKP[-1], color=(0,255,0), flags=cv2.DRAW_MATCHES_FLAGS_DRAW_RICH_KEYPOINTS)
+
+#   cv2.imshow('input', np.concatenate( (np.concatenate(images, axis=0), np.concatenate(imagesKP, axis=0)), axis=1) )
+   cv2.imshow('input',  np.concatenate(imagesKP, axis=0) )
+
+
+   images = preparePictures(images, orb, bf)
+   outpath = imagePath.replace("train_sm", "train_sm_aligned")
+   print "save output to %s" % os.path.dirname(outpath)
+   os.system("mkdir -p " + os.path.dirname(outpath))
+   for index, img in enumerate(images):
+       cv2.imwrite(outpath.replace("_1.jpeg", "_"+str(index+1)+".jpeg"), img)
+
+   merged = mergePictures(images)
+   cv2.imwrite(outpath.replace("_1.jpeg", "_stack.jpeg"), merged )
+   cv2.imshow('merged', merged)
+
+#   imageSum = mergePictures(images)
+   k = cv2.waitKey(10)
+
+#   imwr
+
+
+#   #display the image
+#   cv2.imshow('image', imageList)
+#   cv2.imshow('imageSupp', imageSum)
+#   k = cv2.waitKey(0)
+#   if k == 1048603 or k == -1:         # wait for ESC key to exit
+#      print "ESC"
+#      break
+
+cv2.destroyAllWindows()
